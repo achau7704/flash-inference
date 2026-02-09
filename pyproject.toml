@@ -1,0 +1,21 @@
+[project]
+name = "flash-inference"
+version = "0.1"
+description = "Optimized mini-inference server for a transformer"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "openai",
+    "datasets",
+    "transformers>=4.49.0,<=4.55",
+    "numpy",
+    "einops",
+    "tqdm",
+    "wandb",
+    "pydantic",
+    "tiktoken",
+    "peft",
+    "evaluate",
+    "matplotlib",
+    "markdown"
+]
