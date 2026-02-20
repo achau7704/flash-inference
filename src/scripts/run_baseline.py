@@ -5,7 +5,7 @@ Script that runs baseline prefill and decode.
 import torch
 from src.model.config import Config
 from src.model.transformer import Transformer
-from src.runtime.generate_baseline import generate
+from src.runtime.generate_baseline import generate_baseline
 
 
 def make_random_prompt(model, batch_size: int, seq_len: int):
@@ -67,7 +67,7 @@ def main():
     start.record()
 
     # call the generate function
-    returned_tokens, prefill_time, decode_time_total, decode_times = generate(model=model, input_ids=prompt, max_new_tokens=max_new_tokens)
+    returned_tokens, prefill_time, decode_time_total, decode_times = generate_baseline(model=model, input_ids=prompt, max_new_tokens=max_new_tokens)
 
     end.record()
 

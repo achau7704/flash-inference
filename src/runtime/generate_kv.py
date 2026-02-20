@@ -3,77 +3,120 @@ This script generates max_new_tokens tokens given a model and a starting prompt.
 
 input_ids is the prompt.
 
-I also measure the time for the prefill phase (process the prompt) and decode phase (each subsequent iteration).
+Measures:
+- prefill time (ms): processing the prompt (one full forward)
+- decode time (ms): subsequent per-token decode_step calls
 
-This is an optimization on generate_baseline that uses the KVCache module.
+Uses KVCache to avoid recomputing K/V for past tokens.
 """
 
+from tqdm import tqdm
 import torch
+import time
+
 from src.runtime.inference import prefill, decode_step
 from src.runtime.kv_cache import KVCache
 
-def generate_kv(model, input_ids, max_new_tokens):
+
+def generate_kv(model, input_ids, max_new_tokens, use_tqdm=True, leave=True):
+    """
+    Returns:
+      (output_ids, prefill_ms, decode_ms_total, decode_ms_per_step_list)
+    """
+    assert input_ids.dtype == torch.long, "input_ids must be torch.long"
+    assert input_ids.device == next(model.parameters()).device, "model/input_ids device mismatch"
 
     B, T = input_ids.shape
 
-    # first we want to create our kv cache
+    # create KV cache for this request
     kv_cache = KVCache(config=model.config, batch_size=B)
 
-    # make sure model and input_ids on same device
-    assert input_ids.device == next(model.parameters()).device      # model.parameters() is an iterator so next gets the first parameter tensor
+    # timing
+    use_cuda_timing = torch.cuda.is_available() and input_ids.device.type == "cuda"
 
-    # create CUDA events with timing enabled
-    start_prefill = torch.cuda.Event(enable_timing=True)
-    end_prefill = torch.cuda.Event(enable_timing=True)
+    if use_cuda_timing:
+        start_prefill = torch.cuda.Event(enable_timing=True)
+        end_prefill = torch.cuda.Event(enable_timing=True)
+        start_decode = torch.cuda.Event(enable_timing=True)
+        end_decode = torch.cuda.Event(enable_timing=True)
+    else:
+        start_prefill = end_prefill = start_decode = end_decode = None
 
-    start_decode = torch.cuda.Event(enable_timing=True)
-    end_decode = torch.cuda.Event(enable_timing=True)
-
-    prefill_time = 0
-    decode_time_total = 0
-    decode_times = []
+    prefill_time_ms = 0.0
+    decode_time_total_ms = 0.0
+    decode_times_ms = []
 
     model.eval()
     with torch.no_grad():
-        # time prefill
-        start_prefill.record()
-        
-        # run the prefill forward pass
+        # Prefill (prompt)
+        if use_cuda_timing:
+            start_prefill.record()
+        else:
+            t0 = time.perf_counter()
+
         logits = prefill(model, prompt_ids=input_ids, kv_cache=kv_cache)
 
-        end_prefill.record()
-        torch.cuda.synchronize()
-        prefill_time = start_prefill.elapsed_time(end_prefill)
+        if use_cuda_timing:
+            end_prefill.record()
+            torch.cuda.synchronize()
+            prefill_time_ms = start_prefill.elapsed_time(end_prefill)
+        else:
+            prefill_time_ms = (time.perf_counter() - t0) * 1000.0
 
-        next_id = torch.argmax(logits[:, -1, :], dim=-1).to(torch.long)  # (B,)
-        next_id = next_id.unsqueeze(1)                                   # (B, 1)
+        # prefill should have filled cache to length T
+        assert kv_cache.cur_len == T, f"kv_cache.cur_len={kv_cache.cur_len} != prompt_len={T}"
 
+        # first generated token comes from prefill logits
+        next_id = torch.argmax(logits[:, -1, :], dim=-1).to(torch.long).unsqueeze(1)  # (B, 1)
+
+        # if we're already at max length, stop (no room to append)
         if input_ids.shape[1] >= model.max_seq_len:
-            return input_ids, prefill_time, decode_time_total, decode_times
+            return input_ids, prefill_time_ms, decode_time_total_ms, decode_times_ms
 
         input_ids = torch.cat([input_ids, next_id], dim=1)
-        generated = 1
-        decode_times.append(0.0)        # first token came from prefill
+        generated = 1  # number of generated tokens so far (not counting prompt)
 
-        assert kv_cache.cur_len == input_ids.shape[1]
+        # decode with KV
+        steps = min(max_new_tokens - 1, model.max_seq_len - input_ids.shape[1])
+        start_wall = time.perf_counter()
 
-        # decode remaining tokens using kv cache
-        while generated < max_new_tokens and input_ids.shape[1] < model.max_seq_len:
-            start_decode.record()
-            # decode_step consumes the last generated token and produces logits for the next token
+        iterator = range(steps)
+        if use_tqdm:
+            iterator = tqdm(iterator, desc="KV Decode", leave=leave)
+
+        for _ in iterator:
+            if use_cuda_timing:
+                start_decode.record()
+            else:
+                t1 = time.perf_counter()
+
+            # decode_step consumes the last generated token (next_id) and returns logits for the next token
             last_logits = decode_step(model, next_id, kv_cache=kv_cache)  # (B, vocab)
 
-            end_decode.record()
-            torch.cuda.synchronize()
-            new_time = start_decode.elapsed_time(end_decode)
-            decode_time_total += new_time
-            decode_times.append(new_time)
+            if use_cuda_timing:
+                end_decode.record()
+                torch.cuda.synchronize()
+                step_ms = start_decode.elapsed_time(end_decode)
+            else:
+                step_ms = (time.perf_counter() - t1) * 1000.0
 
-            next_id = torch.argmax(last_logits, dim=-1).to(torch.long)    # (B,)
-            next_id = next_id.unsqueeze(1)                                # (B, 1)
+            decode_time_total_ms += step_ms
+            decode_times_ms.append(step_ms)
 
+            next_id = torch.argmax(last_logits, dim=-1).to(torch.long).unsqueeze(1)  # (B, 1)
             input_ids = torch.cat([input_ids, next_id], dim=1)
             generated += 1
 
-    # return the generated tokens
-    return input_ids, prefill_time, decode_time_total, decode_times
+            # live throughput metrics 
+            if use_tqdm:
+                elapsed_wall = time.perf_counter() - start_wall
+                if elapsed_wall > 0:
+                    tok_per_sec = generated / elapsed_wall
+                    ms_per_tok = (elapsed_wall / generated) * 1000.0
+                    iterator.set_postfix({
+                        "tok/s": f"{tok_per_sec:.1f}",
+                        "ms/tok": f"{ms_per_tok:.2f}",
+                        "seq_len": input_ids.shape[1],
+                    })
+
+    return input_ids, prefill_time_ms, decode_time_total_ms, decode_times_ms
